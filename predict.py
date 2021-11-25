@@ -6,10 +6,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from torchvision import transforms
-from torchvision.io import read_image, ImageReadMode
 
-from utils.data_loading import BasicDataset, ImageDataset
+from utils.data_loading import ImageDataset
 from unet import UNet
 from utils.utils import plot_img_and_mask
 
@@ -24,18 +22,10 @@ def predict_img(net,
 
     with torch.no_grad():
         output = net(img)
-
-        if net.n_classes > 1:
-            probs = F.softmax(output, dim=1)[0]
-        else:
-            probs = torch.sigmoid(output)[0]
-
+        probs = F.softmax(output, dim=1)[0]
         full_mask = probs.cpu().squeeze()
 
-    if net.n_classes == 1:
-        return (full_mask > out_threshold).numpy()
-    else:
-        return F.one_hot(full_mask.argmax(dim=0), net.n_classes).permute(2, 0, 1).numpy()
+    return F.one_hot(full_mask.argmax(dim=0), net.n_classes).permute(2, 0, 1).numpy()
 
 
 def get_args():

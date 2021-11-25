@@ -8,16 +8,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from torch import optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from utils.data_loading import BasicDataset, CarvanaDataset, ImageDataset
+from utils.data_loading import ImageDataset
 from utils.dice_score import dice_loss
 from evaluate import evaluate
 from unet import UNet
 
-# dir_img = Path('./data/imgs/')
-# dir_mask = Path('./data/masks/')
 dir_checkpoint = Path('./checkpoints/')
 
 train_img_path = './data/train/image'
@@ -34,21 +32,14 @@ def train_net(net,
               save_checkpoint: bool = True,
               img_scale: float = 0.5,
               amp: bool = False):
-    # 1. Create dataset
-    # try:
-    #     dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
-    # except (AssertionError, RuntimeError):
-    #     dataset = BasicDataset(dir_img, dir_mask, img_scale)
-
+              
+    # Create datasets
     train_set = ImageDataset(train_img_path, train_mask_path)
     val_set = ImageDataset(val_img_path, val_mask_path)
-
-    # 2. Split into train / validation partitions
     n_val = len(val_set)
     n_train = len(train_set)
-    # train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
 
-    # 3. Create data loaders
+    # Create data loader
     loader_args = dict(batch_size=batch_size, num_workers=4, pin_memory=True)
     train_loader = DataLoader(train_set, shuffle=True, drop_last=True, **loader_args)
     val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
@@ -71,17 +62,18 @@ def train_net(net,
         Mixed Precision: {amp}
     ''')
 
-    # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
+    # Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
     optimizer = optim.RMSprop(net.parameters(), lr=learning_rate, weight_decay=1e-8, momentum=0.9)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=2)  # goal: maximize Dice score
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
     criterion = nn.CrossEntropyLoss()
     global_step = 0
 
-    # 5. Begin training
+    # Begin training
     for epoch in range(epochs):
         net.train()
         epoch_loss = 0
+        # For nice progress bar
         with tqdm(total=n_train, desc=f'Epoch {epoch + 1}/{epochs}', unit='img') as pbar:
             for images, true_masks in train_loader:
 
@@ -95,11 +87,13 @@ def train_net(net,
 
                 with torch.cuda.amp.autocast(enabled=amp):
                     masks_pred = net(images)
+                    # Total loss
                     loss = criterion(masks_pred, true_masks) \
                            + dice_loss(F.softmax(masks_pred, dim=1).float(),
                                        F.one_hot(true_masks, net.n_classes).permute(0, 3, 1, 2).float(),
                                        multiclass=True)
 
+                # Backprop
                 optimizer.zero_grad(set_to_none=True)
                 grad_scaler.scale(loss).backward()
                 grad_scaler.step(optimizer)
@@ -115,7 +109,7 @@ def train_net(net,
                 })
                 pbar.set_postfix(**{'loss (batch)': loss.item()})
 
-                # Evaluation round
+                # Evaluation
                 division_step = (n_train // (10 * batch_size))
                 if division_step > 0:
                     if global_step % division_step == 0:
@@ -142,6 +136,7 @@ def train_net(net,
                             **histograms
                         })
 
+        # Save every epoch
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
             torch.save(net.state_dict(), str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch + 1)))
@@ -170,9 +165,8 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Using device {device}')
 
-    # Change here to adapt to your data
-    # n_channels=3 for RGB images
-    # n_classes is the number of probabilities you want to get per pixel
+    # Grey scale so 1 channel
+    # 4 regions to identify
     net = UNet(n_channels=1, n_classes=4, bilinear=True)
 
     logging.info(f'Network:\n'
@@ -195,6 +189,7 @@ if __name__ == '__main__':
                   val_percent=args.val / 100,
                   amp=args.amp)
     except KeyboardInterrupt:
+        # Save if stopped
         torch.save(net.state_dict(), 'INTERRUPTED.pth')
         logging.info('Saved interrupt')
         sys.exit(0)
