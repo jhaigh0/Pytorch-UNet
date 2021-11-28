@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.optim import optimizer
 import wandb
 from torch import optim
 from torch.utils.data import DataLoader
@@ -15,6 +16,7 @@ from utils.data_loading import ImageDataset
 from utils.dice_score import dice_loss
 from evaluate import evaluate
 from unet import UNet
+from utils.loss import ComboLoss, FocalLoss, FocalTverskyLoss
 
 dir_checkpoint = Path('./checkpoints/')
 
@@ -30,7 +32,6 @@ def train_net(net,
               learning_rate: float = 0.001,
               val_percent: float = 0.1,
               save_checkpoint: bool = True,
-              img_scale: float = 0.5,
               amp: bool = False):
               
     # Create datasets
@@ -47,8 +48,7 @@ def train_net(net,
     # (Initialize logging)
     experiment = wandb.init(project='U-Net', resume='allow', anonymous='must')
     experiment.config.update(dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
-                                  val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale,
-                                  amp=amp))
+                                  val_percent=val_percent, save_checkpoint=save_checkpoint, amp=amp))
 
     logging.info(f'''Starting training:
         Epochs:          {epochs}
@@ -58,15 +58,23 @@ def train_net(net,
         Validation size: {n_val}
         Checkpoints:     {save_checkpoint}
         Device:          {device.type}
-        Images scaling:  {img_scale}
         Mixed Precision: {amp}
     ''')
 
     # Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
     optimizer = optim.RMSprop(net.parameters(), lr=learning_rate, weight_decay=1e-8, momentum=0.9)
+    # optimizer = optim.Rprop(net.parameters(), lr=learning_rate)
+    # optimizer = optim.Adam(net.parameters(), lr=learning_rate, weight_decay=1e-8)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=2)  # goal: maximize Dice score
+
+    # optimizer = optim.RMSprop(net.parameters(), lr=learning_rate, alpha=0.6, weight_decay=0, momentum=0)
+    # scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', factor=0.05, threshold=1e-3, patience=1)
+
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
-    criterion = nn.CrossEntropyLoss()
+    # criterion = nn.CrossEntropyLoss()
+    criterion = ComboLoss()
+    # criterion = FocalLoss()
+    # criterion = FocalTverskyLoss()
     global_step = 0
 
     # Begin training
@@ -88,10 +96,12 @@ def train_net(net,
                 with torch.cuda.amp.autocast(enabled=amp):
                     masks_pred = net(images)
                     # Total loss
-                    loss = criterion(masks_pred, true_masks) \
-                           + dice_loss(F.softmax(masks_pred, dim=1).float(),
-                                       F.one_hot(true_masks, net.n_classes).permute(0, 3, 1, 2).float(),
-                                       multiclass=True)
+                    # loss = criterion(masks_pred, true_masks) \
+                    #        + dice_loss(F.softmax(masks_pred, dim=1).float(),
+                    #                    F.one_hot(true_masks, net.n_classes).permute(0, 3, 1, 2).float(),
+                    #                    multiclass=True)
+
+                    loss = criterion(F.softmax(masks_pred, dim=1).float(), F.one_hot(true_masks, net.n_classes).permute(0, 3, 1, 2).float())
 
                 # Backprop
                 optimizer.zero_grad(set_to_none=True)
@@ -137,7 +147,8 @@ def train_net(net,
                         })
 
         # Save every epoch
-        if save_checkpoint:
+        SAVE_FREQ = 1
+        if save_checkpoint & (epoch % SAVE_FREQ == 0):
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
             torch.save(net.state_dict(), str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch + 1)))
             logging.info(f'Checkpoint {epoch + 1} saved!')
@@ -150,7 +161,6 @@ def get_args():
     parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=0.00001,
                         help='Learning rate', dest='lr')
     parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
-    parser.add_argument('--scale', '-s', type=float, default=0.5, help='Downscaling factor of the images')
     parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
                         help='Percent of the data that is used as validation (0-100)')
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
@@ -185,7 +195,6 @@ if __name__ == '__main__':
                   batch_size=args.batch_size,
                   learning_rate=args.lr,
                   device=device,
-                  img_scale=args.scale,
                   val_percent=args.val / 100,
                   amp=args.amp)
     except KeyboardInterrupt:
